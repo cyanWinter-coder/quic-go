@@ -36,4 +36,11 @@ type SentPacketHandler interface {
 	OnLossDetectionTimeout(now monotime.Time) error
 
 	MigratedPath(now monotime.Time, initialMaxPacketSize protocol.ByteCount)
+	// ResetPeerAddressValidation re-enables the anti-amplification limit.
+	// It is called when the server detects a packet from a not-yet-validated remote
+	// address (e.g. during NAT rebinding), see RFC 9000, section 9.2.1.
+	ResetPeerAddressValidation()
+	// PeerAddressValidated lifts the anti-amplification limit after path validation
+	// (a matching PATH_RESPONSE) completed on the server.
+	PeerAddressValidated()
 }

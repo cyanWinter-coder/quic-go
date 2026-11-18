@@ -565,6 +565,62 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 	require.NotZero(t, sph.GetLossDetectionTimeout())
 }
 
+func TestSentPacketHandlerAmplificationLimitOnNATRebinding(t *testing.T) {
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		true, // the handshake path's address was validated
+		false,
+		nil,
+		protocol.PerspectiveServer,
+		nil,
+		utils.DefaultLogger,
+	)
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+
+	// The client rebinds to a new address. Bytes received on the old path must not
+	// count towards the anti-amplification budget of the new, unvalidated path.
+	sph.ResetPeerAddressValidation()
+	require.Equal(t, SendNone, sph.SendMode(monotime.Now()))
+
+	// Receiving a packet on the new path restores a fresh 3x budget.
+	sph.ReceivedBytes(1000, monotime.Now())
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+	pn := sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+	pn = sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+	pn = sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+	sph.SentPacket(monotime.Now(), pn, protocol.InvalidPacketNumber, nil, []Frame{{Frame: &wire.PingFrame{}}}, protocol.Encryption1RTT, protocol.ECNNon, 1000, false, false)
+	require.Equal(t, SendNone, sph.SendMode(monotime.Now()))
+
+	// Once path validation completes, the anti-amplification limit is lifted.
+	sph.PeerAddressValidated()
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+}
+
+func TestSentPacketHandlerAddressValidationNoopOnClient(t *testing.T) {
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		utils.NewRTTStats(),
+		&utils.ConnectionStats{},
+		false,
+		false,
+		nil,
+		protocol.PerspectiveClient,
+		nil,
+		utils.DefaultLogger,
+	)
+	// Anti-amplification is a server-side concept; client state must be unaffected.
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+	sph.ResetPeerAddressValidation()
+	sph.PeerAddressValidated()
+	require.Equal(t, SendAny, sph.SendMode(monotime.Now()))
+}
+
 func TestSentPacketHandlerAmplificationLimitClient(t *testing.T) {
 	t.Run("handshake ACK", func(t *testing.T) {
 		testSentPacketHandlerAmplificationLimitClient(t, false)

@@ -761,3 +761,69 @@ func TestFramer0RTTRejection(t *testing.T) {
 	require.Contains(t, controlFrames, ackhandler.Frame{Frame: ping})
 	require.Contains(t, controlFrames, ackhandler.Frame{Frame: ncid})
 }
+
+// During a migration, a large stream must not fill the entire (reset, small) congestion
+// window. The framer rotates through the active incremental streams once each stream
+// exhausted its per-round budget.
+func TestFramerMigrationFairness(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	const str1ID, str2ID protocol.StreamID = 0, 4
+	bigFrame := func(id protocol.StreamID) *wire.StreamFrame {
+		return &wire.StreamFrame{StreamID: id, DataLenPresent: true, Data: make([]byte, 1200)}
+	}
+
+	framer := newFramer(newConnectionFlowController(0, 0, nil, nil, nil))
+	str1 := NewMockStreamFrameGetter(mockCtrl)
+	str1.EXPECT().priority().Return(defaultUrgency, true, uint32(0)).AnyTimes()
+	str1.EXPECT().popStreamFrame(gomock.Any(), protocol.Version1).
+		Return(ackhandler.StreamFrame{Frame: bigFrame(str1ID)}, nil, true).AnyTimes()
+	str2 := NewMockStreamFrameGetter(mockCtrl)
+	str2.EXPECT().priority().Return(defaultUrgency, true, uint32(0)).AnyTimes()
+	str2.EXPECT().popStreamFrame(gomock.Any(), protocol.Version1).
+		Return(ackhandler.StreamFrame{Frame: bigFrame(str2ID)}, nil, true).AnyTimes()
+	framer.AddActiveStream(str1ID, str1)
+	framer.AddActiveStream(str2ID, str2)
+
+	now := monotime.Now()
+	framer.BeginMigration(now)
+
+	// Pop STREAM frames over many packets and count how many each stream sent.
+	const packets = 50
+	sent := map[protocol.StreamID]int{}
+	for range packets {
+		_, streamFrames, _ := framer.AppendStreamFrames(nil, nil, 1200, protocol.Version1)
+		for _, sf := range streamFrames {
+			sent[sf.Frame.StreamID]++
+		}
+	}
+	require.Contains(t, sent, str1ID)
+	require.Contains(t, sent, str2ID)
+	// neither stream may be starved: each gets at least 40% of the send opportunities
+	for id, n := range sent {
+		require.GreaterOrEqual(t, float64(n)/float64(packets), 0.4, "stream %d starved: %d/%d", id, n, packets)
+	}
+	require.InDelta(t, sent[str1ID], sent[str2ID], 2)
+
+	// after the migration completes, normal scheduling resumes and the state is cleared
+	framer.EndMigration()
+	require.False(t, framer.migrationFairness.Active())
+	require.Empty(t, framer.migrationFairness.sent)
+}
+
+// Without a migration, the scheduler does not impose any additional restriction.
+func TestFramerNoFairnessWithoutMigration(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	const str1ID protocol.StreamID = 0
+	framer := newFramer(newConnectionFlowController(0, 0, nil, nil, nil))
+	str1 := NewMockStreamFrameGetter(mockCtrl)
+	str1.EXPECT().priority().Return(defaultUrgency, true, uint32(0)).AnyTimes()
+	str1.EXPECT().popStreamFrame(gomock.Any(), protocol.Version1).
+		Return(ackhandler.StreamFrame{Frame: &wire.StreamFrame{StreamID: str1ID, DataLenPresent: true, Data: make([]byte, 1200)}}, nil, true).AnyTimes()
+	framer.AddActiveStream(str1ID, str1)
+
+	require.False(t, framer.migrationFairness.Active())
+	for range 10 {
+		_, streamFrames, _ := framer.AppendStreamFrames(nil, nil, 1200, protocol.Version1)
+		require.Len(t, streamFrames, 1)
+	}
+}

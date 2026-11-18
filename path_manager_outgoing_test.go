@@ -351,3 +351,47 @@ func TestPathManagerOutgoingAbandonValidatedPath(t *testing.T) {
 			"the connection ID of a validated path must be retired when the path is abandoned")
 	})
 }
+
+func TestPathManagerOutgoingProbeTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var retiredPaths []pathID
+		pm := newPathManagerOutgoing(
+			func(id pathID) (protocol.ConnectionID, bool) {
+				return protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}), true
+			},
+			func(id pathID) { retiredPaths = append(retiredPaths, id) },
+			func() {},
+		)
+
+		p := pm.NewPath(&Transport{}, time.Second, func(pathID) {})
+		errChan := make(chan error, 1)
+		go func() { errChan <- p.Probe(context.Background()) }()
+		synctest.Wait()
+
+		// drain the path challenges, but never send a PATH_RESPONSE
+		for {
+			_, _, _, ok := pm.NextPathToProbe()
+			if !ok {
+				break
+			}
+		}
+
+		// advance the (virtual) clock past the validation timeout
+		time.Sleep(pathValidationTimeout + time.Second)
+		synctest.Wait()
+		require.ErrorIs(t, <-errChan, ErrPathValidationTimeout)
+		require.Contains(t, retiredPaths, p.id)
+
+		// the path can no longer be switched to; re-probing re-creates it and times out again
+		require.ErrorIs(t, p.Switch(), ErrPathNotValidated)
+		go func() { errChan <- p.Probe(context.Background()) }()
+		for {
+			if _, _, _, ok := pm.NextPathToProbe(); !ok {
+				break
+			}
+		}
+		time.Sleep(pathValidationTimeout + time.Second)
+		synctest.Wait()
+		require.ErrorIs(t, <-errChan, ErrPathValidationTimeout)
+	})
+}

@@ -185,3 +185,47 @@ func TestSimConnDeadlinesWithLatency(t *testing.T) {
 		require.ErrorIs(t, err, ErrDeadlineExceeded)
 	})
 }
+
+func TestSimConnRebind(t *testing.T) {
+	router := &PerfectRouter{}
+	oldAddr := &net.UDPAddr{IP: randomPublicIPv4(), Port: 1000}
+	newAddr := &net.UDPAddr{IP: randomPublicIPv4(), Port: 2000}
+	peerAddr := &net.UDPAddr{IP: randomPublicIPv4(), Port: 4000}
+
+	client := NewSimConn(oldAddr, router)
+	peer := NewSimConn(peerAddr, router)
+
+	// before rebinding, packets carry the old source address
+	_, err := client.WriteTo([]byte("before"), peerAddr)
+	require.NoError(t, err)
+	buf := make([]byte, 1024)
+	n, from, err := peer.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "before", string(buf[:n]))
+	require.Equal(t, oldAddr, from)
+
+	require.NoError(t, client.Rebind(newAddr))
+	require.Equal(t, newAddr, client.LocalAddr())
+
+	// after rebinding, outgoing packets use the new source address
+	_, err = client.WriteTo([]byte("after"), peerAddr)
+	require.NoError(t, err)
+	n, from, err = peer.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "after", string(buf[:n]))
+	require.Equal(t, newAddr, from)
+
+	// packets sent to the old address are no longer delivered to the client
+	_, err = peer.WriteTo([]byte("stale"), oldAddr)
+	require.Error(t, err) // the old binding was unregistered
+	// packets sent to the new address are delivered
+	_, err = peer.WriteTo([]byte("fresh"), newAddr)
+	require.NoError(t, err)
+	n, _, err = client.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "fresh", string(buf[:n]))
+
+	// rebinding a closed connection fails
+	require.NoError(t, client.Close())
+	require.ErrorIs(t, client.Rebind(oldAddr), net.ErrClosed)
+}

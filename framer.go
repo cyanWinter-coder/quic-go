@@ -69,6 +69,8 @@ type framer struct {
 	pathResponses              []*wire.PathResponseFrame
 	connFlowController         *connectionFlowController
 	queuedTooManyControlFrames bool
+
+	migrationFairness *migrationFairnessScheduler
 }
 
 func newFramer(connFlowController *connectionFlowController) *framer {
@@ -77,7 +79,22 @@ func newFramer(connFlowController *connectionFlowController) *framer {
 		retransmissionStreams:    make(map[protocol.StreamID]streamFrameGetter),
 		streamsWithControlFrames: make(map[protocol.StreamID]streamControlFrameGetter),
 		connFlowController:       connFlowController,
+		migrationFairness:        newMigrationFairnessScheduler(),
 	}
+}
+
+// BeginMigration enables per-stream fair scheduling while a path migration is in progress.
+func (f *framer) BeginMigration(now monotime.Time) {
+	f.mutex.Lock()
+	f.migrationFairness.Begin(now)
+	f.mutex.Unlock()
+}
+
+// EndMigration disables per-stream fair scheduling after the migration completed.
+func (f *framer) EndMigration() {
+	f.mutex.Lock()
+	f.migrationFairness.End()
+	f.mutex.Unlock()
 }
 
 func (f *framer) HasData() bool {
@@ -179,7 +196,14 @@ retransmissions:
 	for urgency := range f.incrementalStreams {
 		numActiveStreams := f.incrementalStreams[urgency].Len() + f.nonIncrementalStreams[urgency].Len()
 
-		for range numActiveStreams {
+		// During a migration, streams that exhausted their per-round budget are skipped,
+		// but remain queued. Cap the number of iterations to avoid spinning while the
+		// round completes within this packet.
+		maxIterations := numActiveStreams
+		if f.migrationFairness.Active() {
+			maxIterations = 2 * numActiveStreams
+		}
+		for range maxIterations {
 			if protocol.MinStreamFrameSize > maxLen {
 				break
 			}
@@ -189,6 +213,7 @@ retransmissions:
 				maxLen -= sf.Frame.Length(v)
 				lastFrame = sf
 				streamFrameLen += sf.Frame.Length(v)
+				f.migrationFairness.Observe(sf.Frame.StreamID, sf.Frame.Length(v))
 			}
 			// If the stream just became blocked on stream flow control, attempt to pack the
 			// STREAM_DATA_BLOCKED into the same packet.
@@ -407,6 +432,13 @@ func (f *framer) getNextIncrementalStreamFrame(
 	}
 	_, _, generation := str.priority()
 	if generation != entry.generation {
+		return ackhandler.StreamFrame{}, nil
+	}
+	if !f.migrationFairness.Acquire(entry.id, queue.Len()+1, monotime.Now()) {
+		// The stream used up its per-round migration budget. Re-queue it at the back
+		// so the other streams get a send opportunity before its next round.
+		queue.PushBack(entry)
+		f.migrationFairness.Defer(entry.id)
 		return ackhandler.StreamFrame{}, nil
 	}
 

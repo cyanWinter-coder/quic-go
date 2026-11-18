@@ -268,6 +268,42 @@ func (c *MockSentPacketHandlerPeekPacketNumberCall) DoAndReturn(f func(protocol.
 	return c
 }
 
+// PeerAddressValidated mocks base method.
+func (m *MockSentPacketHandler) PeerAddressValidated() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "PeerAddressValidated")
+}
+
+// PeerAddressValidated indicates an expected call of PeerAddressValidated.
+func (mr *MockSentPacketHandlerMockRecorder) PeerAddressValidated() *MockSentPacketHandlerPeerAddressValidatedCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PeerAddressValidated", reflect.TypeOf((*MockSentPacketHandler)(nil).PeerAddressValidated))
+	return &MockSentPacketHandlerPeerAddressValidatedCall{Call: call}
+}
+
+// MockSentPacketHandlerPeerAddressValidatedCall wrap *gomock.Call
+type MockSentPacketHandlerPeerAddressValidatedCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerPeerAddressValidatedCall) Return() *MockSentPacketHandlerPeerAddressValidatedCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerPeerAddressValidatedCall) Do(f func()) *MockSentPacketHandlerPeerAddressValidatedCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerPeerAddressValidatedCall) DoAndReturn(f func()) *MockSentPacketHandlerPeerAddressValidatedCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // PopPacketNumber mocks base method.
 func (m *MockSentPacketHandler) PopPacketNumber(arg0 protocol.PacketNumberSpace) protocol.PacketNumber {
 	m.ctrl.T.Helper()
@@ -487,6 +523,42 @@ func (c *MockSentPacketHandlerResetForRetryCall) Do(f func(monotime.Time)) *Mock
 
 // DoAndReturn rewrite *gomock.Call.DoAndReturn
 func (c *MockSentPacketHandlerResetForRetryCall) DoAndReturn(f func(monotime.Time)) *MockSentPacketHandlerResetForRetryCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
+// ResetPeerAddressValidation mocks base method.
+func (m *MockSentPacketHandler) ResetPeerAddressValidation() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ResetPeerAddressValidation")
+}
+
+// ResetPeerAddressValidation indicates an expected call of ResetPeerAddressValidation.
+func (mr *MockSentPacketHandlerMockRecorder) ResetPeerAddressValidation() *MockSentPacketHandlerResetPeerAddressValidationCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ResetPeerAddressValidation", reflect.TypeOf((*MockSentPacketHandler)(nil).ResetPeerAddressValidation))
+	return &MockSentPacketHandlerResetPeerAddressValidationCall{Call: call}
+}
+
+// MockSentPacketHandlerResetPeerAddressValidationCall wrap *gomock.Call
+type MockSentPacketHandlerResetPeerAddressValidationCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockSentPacketHandlerResetPeerAddressValidationCall) Return() *MockSentPacketHandlerResetPeerAddressValidationCall {
+	c.Call = c.Call.Return()
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockSentPacketHandlerResetPeerAddressValidationCall) Do(f func()) *MockSentPacketHandlerResetPeerAddressValidationCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockSentPacketHandlerResetPeerAddressValidationCall) DoAndReturn(f func()) *MockSentPacketHandlerResetPeerAddressValidationCall {
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }

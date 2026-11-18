@@ -1275,3 +1275,27 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 	h.qlogRecoveryParametersSet(true)
 	h.setLossDetectionTimer(now)
 }
+
+// ResetPeerAddressValidation re-enables the anti-amplification limit after the
+// server received a packet from a new, not-yet-validated address.
+// Bytes received on the old path can't be counted towards the anti-amplification
+// budget of the new path, since the new address might be a spoofed source address.
+// The limit is lifted again once the address is validated (see ReceivedPacket).
+func (h *sentPacketHandler) ResetPeerAddressValidation() {
+	if h.perspective != protocol.PerspectiveServer {
+		return
+	}
+	h.peerAddressValidated = false
+	// Start with a fresh anti-amplification budget for the new path.
+	h.bytesReceived = 0
+	h.bytesSent = 0
+}
+
+// PeerAddressValidated marks the peer's current address as validated, lifting
+// the anti-amplification limit. It is called once path validation completed.
+func (h *sentPacketHandler) PeerAddressValidated() {
+	if h.perspective != protocol.PerspectiveServer {
+		return
+	}
+	h.peerAddressValidated = true
+}

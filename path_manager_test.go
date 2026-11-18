@@ -391,6 +391,86 @@ func TestPathManagerLimits(t *testing.T) {
 	require.Empty(t, frames)
 }
 
+func TestPathManagerValidationTimeout(t *testing.T) {
+	connIDs := []protocol.ConnectionID{
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}),
+		protocol.ParseConnectionID([]byte{2, 3, 4, 5, 6, 7, 8, 9}),
+	}
+	var retiredConnIDs []protocol.ConnectionID
+	pm := newPathManager(
+		func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
+		func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
+		utils.DefaultLogger,
+	)
+
+	now := monotime.Now()
+	addr1 := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}
+	id, isNew, ok := pm.GetOrCreatePath(addr1, now)
+	require.True(t, ok)
+	require.True(t, isNew)
+	require.Equal(t, pathID(0), id)
+
+	// the validation timeout is the earliest timer
+	deadline := pm.ValidationTimeout()
+	require.False(t, deadline.IsZero())
+	require.Equal(t, pathValidationTimeout, deadline.Sub(now))
+
+	// before the timeout, the path is kept and probed
+	require.Empty(t, pm.HandleValidationTimeout(now.Add(pathValidationTimeout-time.Millisecond)))
+	require.Empty(t, retiredConnIDs)
+
+	// a second path created later has an independent deadline
+	addr2 := &net.UDPAddr{IP: net.IPv4(5, 6, 7, 8), Port: 2000}
+	later := now.Add(time.Second)
+	id2, isNew, ok := pm.GetOrCreatePath(addr2, later)
+	require.True(t, ok)
+	require.True(t, isNew)
+	require.Equal(t, pathID(1), id2)
+	require.Equal(t, now.Add(pathValidationTimeout), pm.ValidationTimeout())
+
+	// the first path fails validation and is closed, retiring its connection ID
+	closed := pm.HandleValidationTimeout(now.Add(pathValidationTimeout))
+	require.Equal(t, []net.Addr{addr1}, closed)
+	require.Equal(t, []protocol.ConnectionID{connIDs[0]}, retiredConnIDs)
+
+	// the surviving path still has its deadline, and no application-data switch is possible
+	require.Equal(t, later.Add(pathValidationTimeout), pm.ValidationTimeout())
+	connID, frames, shouldSwitch := pm.HandlePacket(addr2, later, nil, true)
+	require.False(t, shouldSwitch)
+
+	require.NotEmpty(t, frames)
+	require.Equal(t, connIDs[1], connID)
+	validated := pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: frames[0].Frame.(*wire.PathChallengeFrame).Data})
+	require.True(t, validated)
+	require.True(t, pm.ValidationTimeout().IsZero())
+
+	// a duplicate PATH_RESPONSE doesn't report a new validation
+	require.False(t, pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: frames[0].Frame.(*wire.PathChallengeFrame).Data}))
+	// validated paths survive the timeout handling
+	require.Empty(t, pm.HandleValidationTimeout(later.Add(pathValidationTimeout+time.Second)))
+}
+
+func TestPathManagerValidationTimeoutKeepsValidatedPath(t *testing.T) {
+	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8})
+	pm := newPathManager(
+		func(pathID) (protocol.ConnectionID, bool) { return connID, true },
+		func(pathID) {},
+		utils.DefaultLogger,
+	)
+
+	now := monotime.Now()
+	addr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 1000}
+	pm.GetOrCreatePath(addr, now)
+	_, frames, _ := pm.HandlePacket(addr, now, nil, false)
+	require.NotEmpty(t, frames)
+	require.True(t, pm.HandlePathResponseFrame(&wire.PathResponseFrame{Data: frames[0].Frame.(*wire.PathChallengeFrame).Data}))
+
+	// long after the original deadline, the validated path must remain usable
+	require.Empty(t, pm.HandleValidationTimeout(now.Add(pathValidationTimeout+time.Minute)))
+	_, _, shouldSwitch := pm.HandlePacket(addr, now.Add(pathValidationTimeout+time.Minute), nil, true)
+	require.True(t, shouldSwitch)
+}
+
 type mockAddr struct {
 	str string
 }

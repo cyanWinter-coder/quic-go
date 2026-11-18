@@ -266,6 +266,38 @@ func (c *SimConn) LocalAddr() net.Addr {
 	return c.myAddr
 }
 
+// Rebind changes the connection's source address, simulating a NAT rebinding.
+// Subsequent outgoing packets carry the new address as their source, and incoming
+// packets addressed to the new address are delivered to this connection.
+// The old address is unregistered, so packets sent to it are no longer delivered,
+// matching a NAT that stops forwarding traffic to the previous binding.
+func (c *SimConn) Rebind(addr *net.UDPAddr) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	oldAddr := c.myAddr
+	c.myAddr = addr
+	c.mu.Unlock()
+	if r, ok := c.router.(interface{ RemoveNode(net.Addr) }); ok {
+		r.RemoveNode(oldAddr)
+	}
+	c.router.AddNode(addr, c)
+	// Drain packets still queued for the old binding. A real NAT stops delivering
+	// traffic for the previous binding, and leaving them in the bounded receive
+	// channel could otherwise cause packets on the new binding to be dropped.
+drain:
+	for {
+		select {
+		case <-c.packetsToRead:
+		default:
+			break drain
+		}
+	}
+	return nil
+}
+
 func (c *SimConn) SetDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

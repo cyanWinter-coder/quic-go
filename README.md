@@ -36,6 +36,10 @@ Related projects:
 
 Detailed documentation can be found on [quic-go.net](https://quic-go.net/docs/).
 
+## Documentation
+
+* [Connection Migration and Flow Control](docs/connection-migration.md): path validation, congestion-state reset, anti-amplification on NAT rebinding, and fair stream scheduling during migration.
+
 ## FIPS 140-3
 
 Starting with v0.60, quic-go supports use in FIPS 140-3 environments when built with Go 1.26 or newer, using Go standard library cryptography for the QUIC code paths relevant in FIPS mode; see [FIPS140.md](FIPS140.md) for details.

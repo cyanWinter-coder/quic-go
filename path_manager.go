@@ -2,6 +2,7 @@ package quic
 
 import (
 	"crypto/rand"
+	"errors"
 	"net"
 	"slices"
 	"time"
@@ -28,14 +29,25 @@ const maxPaths = 3
 // sending them with spoofed source addresses.
 const pathTimeout = 5 * time.Second
 
+// pathValidationTimeout is the time after which an unvalidated path fails validation.
+// Until a path is validated, the server only sends path probes (PATH_CHALLENGE and
+// PATH_RESPONSE frames), but no application data, to it. If the peer fails to return a
+// matching PATH_RESPONSE within this timeout, the path is closed.
+const pathValidationTimeout = pathTimeout
+
+// ErrPathValidationTimeout is returned when a path fails to validate within
+// pathValidationTimeout.
+var ErrPathValidationTimeout = errors.New("path validation timed out")
+
 type path struct {
-	id             pathID
-	addr           net.Addr
-	lastPacketTime monotime.Time
-	pathChallenges [][8]byte // length is implicitly limited by exponential backoff
-	nextProbeTime  monotime.Time
-	validated      bool
-	rcvdNonProbing bool
+	id                 pathID
+	addr               net.Addr
+	lastPacketTime     monotime.Time
+	pathChallenges     [][8]byte // length is implicitly limited by exponential backoff
+	nextProbeTime      monotime.Time
+	validationDeadline monotime.Time
+	validated          bool
+	rcvdNonProbing     bool
 }
 
 type pathManager struct {
@@ -157,27 +169,69 @@ func (pm *pathManager) GetOrCreatePath(remoteAddr net.Addr, t monotime.Time) (_ 
 	}
 
 	p := &path{
-		id:             pm.nextPathID,
-		addr:           remoteAddr,
-		lastPacketTime: t,
-		nextProbeTime:  t,
-		pathChallenges: make([][8]byte, 0, 2),
+		id:                 pm.nextPathID,
+		addr:               remoteAddr,
+		lastPacketTime:     t,
+		nextProbeTime:      t,
+		validationDeadline: t.Add(pathValidationTimeout),
+		pathChallenges:     make([][8]byte, 0, 2),
 	}
 	pm.nextPathID++
 	pm.paths = append(pm.paths, p)
 	return p.id, true, true
 }
 
-func (pm *pathManager) HandlePathResponseFrame(f *wire.PathResponseFrame) {
+// HandlePathResponseFrame processes a PATH_RESPONSE frame.
+// It returns true if the frame validated a previously unvalidated path.
+func (pm *pathManager) HandlePathResponseFrame(f *wire.PathResponseFrame) bool {
 	for _, p := range pm.paths {
 		if slices.Contains(p.pathChallenges, f.Data) {
 			// path validated
+			if p.validated {
+				return false
+			}
 			p.validated = true
 			p.pathChallenges = nil
+			p.validationDeadline = 0
 			pm.logger.Debugf("path %s validated", p.addr)
-			break
+			return true
 		}
 	}
+	return false
+}
+
+// ValidationTimeout returns the time at which the next unvalidated path fails
+// validation. It returns the zero time if there are no unvalidated paths.
+func (pm *pathManager) ValidationTimeout() monotime.Time {
+	var deadline monotime.Time = 0
+	for _, p := range pm.paths {
+		if p.validated {
+			continue
+		}
+		if deadline.IsZero() || p.validationDeadline.Before(deadline) {
+			deadline = p.validationDeadline
+		}
+	}
+	return deadline
+}
+
+// HandleValidationTimeout closes all paths that failed to validate.
+// It returns the addresses of the paths that were closed.
+// Application data is never sent on a path that failed validation.
+func (pm *pathManager) HandleValidationTimeout(t monotime.Time) []net.Addr {
+	var closed []net.Addr
+	remaining := pm.paths[:0]
+	for _, p := range pm.paths {
+		if !p.validated && !p.validationDeadline.IsZero() && !t.Before(p.validationDeadline) {
+			pm.logger.Debugf("path %s failed to validate within %s", p.addr, pathValidationTimeout)
+			pm.retireConnID(p.id)
+			closed = append(closed, p.addr)
+			continue
+		}
+		remaining = append(remaining, p)
+	}
+	pm.paths = remaining
+	return closed
 }
 
 // SwitchToPath is called when the connection switches to a new path

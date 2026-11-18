@@ -40,6 +40,8 @@ func (p *Path) Probe(ctx context.Context) error {
 
 	p.pathManager.enqueueProbe(p)
 	nextProbeDur := p.initialRTT
+	deadlineTimer := time.NewTimer(pathValidationTimeout)
+	defer deadlineTimer.Stop()
 	var timer *time.Timer
 	var timerChan <-chan time.Time
 	for {
@@ -49,6 +51,11 @@ func (p *Path) Probe(ctx context.Context) error {
 		case <-path.Validated():
 			p.validated.Store(true)
 			return nil
+		case <-deadlineTimer.C:
+			if err := p.pathManager.removePath(p.id); err != nil {
+				return err
+			}
+			return ErrPathValidationTimeout
 		case <-timerChan:
 			nextProbeDur *= 2 // exponential backoff
 			p.pathManager.enqueueProbe(p)

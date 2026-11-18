@@ -679,6 +679,18 @@ runLoop:
 			}
 		}
 
+		// Close paths that failed to validate in time. No application data is ever sent on them.
+		if c.pathManager != nil {
+			closed := c.pathManager.HandleValidationTimeout(now)
+			for _, addr := range closed {
+				c.logger.Debugf("closing path %s: %s", addr, ErrPathValidationTimeout)
+			}
+			// Once no path remains unvalidated, migration fair scheduling is no longer needed.
+			if c.pathManager.ValidationTimeout().IsZero() {
+				c.framer.EndMigration()
+			}
+		}
+
 		if keepAliveTime := c.nextKeepAliveTime(); !keepAliveTime.IsZero() && !now.Before(keepAliveTime) {
 			// send a PING frame since there is no activity in the connection
 			c.logger.Debugf("Sending a keep-alive PING to keep the connection alive.")
@@ -705,6 +717,7 @@ runLoop:
 				if ok {
 					c.connIDManager.SwitchToPath(id)
 					c.switchToNewPath(tr, now)
+					c.framer.EndMigration()
 				}
 			}
 		}
@@ -896,6 +909,11 @@ func (c *Conn) maybeResetTimer() {
 	}
 	if t := c.sentPacketHandler.GetLossDetectionTimeout(); !t.IsZero() && t.Before(deadline) {
 		deadline = t
+	}
+	if c.pathManager != nil {
+		if t := c.pathManager.ValidationTimeout(); !t.IsZero() && t.Before(deadline) {
+			deadline = t
+		}
 	}
 	if c.blocked == blockModeCongestionLimited {
 		c.timer.Reset(monotime.Until(deadline))
@@ -1259,6 +1277,14 @@ func (c *Conn) handleShortHeaderPacket(
 			if isNew && c.qlogger != nil {
 				c.qlogger.RecordEvent(tupleAssignedEvent(strconv.FormatInt(int64(id), 10), c.conn.LocalAddr(), p.remoteAddr))
 			}
+			if isNew {
+				// Packets from the old path's address can't be counted towards the anti-amplification
+				// budget of the new path, as the source address might be spoofed (RFC 9000, section 9.2.1).
+				c.sentPacketHandler.ResetPeerAddressValidation()
+				// Schedule stream send opportunities fairly until the new path is validated
+				// and the connection switched to it.
+				c.framer.BeginMigration(p.rcvTime)
+			}
 		}
 	}
 
@@ -1318,6 +1344,7 @@ func (c *Conn) handleShortHeaderPacket(
 	}
 	c.pathManager.SwitchToPath(p.remoteAddr)
 	c.connIDManager.SwitchToPath(path)
+	c.framer.EndMigration()
 	initialPacketSize := protocol.ByteCount(cmp.Or(c.config.InitialPacketSize, protocol.MinInitialPacketSize))
 	c.sentPacketHandler.MigratedPath(p.rcvTime, initialPacketSize)
 	c.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialPacketSize)))
@@ -2177,7 +2204,10 @@ func (c *Conn) handlePathResponseFrameServer(f *wire.PathResponseFrame) error {
 			ErrorMessage: "unexpected PATH_RESPONSE frame",
 		}
 	}
-	c.pathManager.HandlePathResponseFrame(f)
+	if c.pathManager.HandlePathResponseFrame(f) {
+		// The new path's source address is now validated, so the anti-amplification limit no longer applies.
+		c.sentPacketHandler.PeerAddressValidated()
+	}
 	return nil
 }
 
@@ -2577,6 +2607,9 @@ func (c *Conn) sendPackets(now monotime.Time) error {
 		if pm := c.pathManagerOutgoing.Load(); pm != nil {
 			connID, frame, tr, ok := pm.NextPathToProbe()
 			if ok {
+				// Until the new path is validated and switched to, schedule stream send
+				// opportunities fairly so a single large stream can't fill the whole window.
+				c.framer.BeginMigration(now)
 				probe, buf, err := c.packer.PackPathProbePacket(connID, []ackhandler.Frame{frame}, c.version)
 				if err != nil {
 					return err
