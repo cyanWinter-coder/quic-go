@@ -3180,6 +3180,8 @@ func (c *Conn) recordStreamPriorityUpdated(id protocol.StreamID, urgency int8, i
 // The payload of the datagram needs to fit into a single QUIC packet.
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a [DatagramTooLargeError] is returned.
+// If the datagram send queue is full, [ErrDatagramQueueFull] is returned immediately,
+// without blocking the caller. The datagram can be resent once the queue has drained.
 func (c *Conn) SendDatagram(p []byte) error {
 	params := c.peerParams.Load()
 	if params.MaxDatagramFrameSize <= 0 {

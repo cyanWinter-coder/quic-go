@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -104,3 +105,8 @@ func (e *DatagramTooLargeError) Is(target error) bool {
 }
 
 func (e *DatagramTooLargeError) Error() string { return "DATAGRAM frame too large" }
+
+// ErrDatagramQueueFull is returned from [Conn.SendDatagram] if the datagram send queue
+// is full. It is returned immediately, without blocking the caller. The caller can use
+// it as a signal to slow down the sending rate, and retry sending the datagram later.
+var ErrDatagramQueueFull = errors.New("datagram send queue full")

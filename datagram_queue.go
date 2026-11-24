@@ -19,7 +19,6 @@ const (
 type datagramQueue struct {
 	sendMx    sync.Mutex
 	sendQueue ringbuffer.RingBuffer[*wire.DatagramFrame]
-	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
 	rcvMx    sync.Mutex
 	rcvQueue [][]byte
@@ -38,7 +37,6 @@ func newDatagramQueue(hasData func(), logger utils.Logger, qlogger qlogwriter.Re
 	return &datagramQueue{
 		hasData: hasData,
 		rcvd:    make(chan struct{}, 1),
-		sent:    make(chan struct{}, 1),
 		closed:  make(chan struct{}),
 		logger:  logger,
 		qlogger: qlogger,
@@ -46,39 +44,35 @@ func newDatagramQueue(hasData func(), logger utils.Logger, qlogger qlogwriter.Re
 }
 
 // Add queues a new DATAGRAM frame for sending.
-// Up to 32 DATAGRAM frames will be queued.
-// Once that limit is reached, Add blocks until the queue size has reduced.
+// Up to maxDatagramSendQueueLen DATAGRAM frames will be queued.
+// If the queue is full, [ErrDatagramQueueFull] is returned immediately,
+// without blocking the caller.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
+	defer h.sendMx.Unlock()
 
-	for {
-		// don't queue frames after the connection is closed
-		select {
-		case <-h.closed:
-			h.sendMx.Unlock()
-			return h.closeErr
-		default:
-		}
-
-		if h.sendQueue.Len() < maxDatagramSendQueueLen {
-			h.sendQueue.PushBack(f)
-			h.sendMx.Unlock()
-			h.hasData()
-			return nil
-		}
-		select {
-		case <-h.sent: // drain any stale notification, so we don't wake up immediately below
-		default:
-		}
-		h.sendMx.Unlock()
-		// The queue is full. Wait until a frame is dequeued.
-		select {
-		case <-h.closed:
-			return h.closeErr
-		case <-h.sent:
-		}
-		h.sendMx.Lock()
+	// don't queue frames after the connection is closed
+	select {
+	case <-h.closed:
+		return h.closeErr
+	default:
 	}
+
+	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
+		return ErrDatagramQueueFull
+	}
+	h.sendQueue.PushBack(f)
+	h.hasData()
+	return nil
+}
+
+// SendQueueLen returns the number of DATAGRAM frames currently queued for sending.
+// It can be used as an input for pacing the sending of datagrams:
+// a growing queue length indicates congestion on the path.
+func (h *datagramQueue) SendQueueLen() int {
+	h.sendMx.Lock()
+	defer h.sendMx.Unlock()
+	return h.sendQueue.Len()
 }
 
 // Peek gets the next DATAGRAM frame for sending.
@@ -96,10 +90,6 @@ func (h *datagramQueue) Pop() {
 	h.sendMx.Lock()
 	defer h.sendMx.Unlock()
 	_ = h.sendQueue.PopFront()
-	select {
-	case h.sent <- struct{}{}:
-	default:
-	}
 }
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
@@ -158,6 +148,15 @@ func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 }
 
 func (h *datagramQueue) CloseWithError(e error) {
+	h.sendMx.Lock()
+	h.sendQueue.Clear()
+	h.sendMx.Unlock()
+
+	h.rcvMx.Lock()
+	h.rcvQueue = nil
+	h.rcvMx.Unlock()
+
 	h.closeErr = e
+	// wake up all Add and Receive calls waiting on the closed channel
 	close(h.closed)
 }

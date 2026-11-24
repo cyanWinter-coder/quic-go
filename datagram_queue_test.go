@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -31,49 +32,38 @@ func TestDatagramQueuePeekAndPop(t *testing.T) {
 }
 
 func TestDatagramQueueSendQueueLength(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		queue := newDatagramQueue(func() {}, utils.DefaultLogger, nil)
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger, nil)
 
-		for range maxDatagramSendQueueLen {
-			require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte{0}}))
-		}
-		errChan := make(chan error, 1)
-		go func() { errChan <- queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}) }()
+	// the queue accepts up to maxDatagramSendQueueLen datagrams, in FIFO order
+	for i := range maxDatagramSendQueueLen {
+		require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte{byte(i)}}))
+		require.Equal(t, i+1, queue.SendQueueLen())
+	}
 
-		synctest.Wait()
+	// a full queue rejects new datagrams immediately, without blocking
+	errChan := make(chan error, 1)
+	go func() { errChan <- queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}) }()
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, ErrDatagramQueueFull)
+	case <-time.After(time.Second):
+		t.Fatal("Add blocked on a full queue")
+	}
+	require.Equal(t, maxDatagramSendQueueLen, queue.SendQueueLen())
 
-		select {
-		case <-errChan:
-			t.Fatal("expected to not receive error")
-		default:
-		}
-
-		// peeking doesn't remove the datagram from the queue...
-		require.NotNil(t, queue.Peek())
-		synctest.Wait()
-		select {
-		case <-errChan:
-			t.Fatal("expected to not receive error")
-		default:
-		}
-
-		// ...but popping does
-		queue.Pop()
-		synctest.Wait()
-		select {
-		case err := <-errChan:
-			require.NoError(t, err)
-		default:
-			t.Fatal("timeout")
-		}
-		// pop all the remaining datagrams
-		for range maxDatagramSendQueueLen - 1 {
-			queue.Pop()
-		}
+	// dequeueing happens in the same order as enqueueing
+	for i := range maxDatagramSendQueueLen {
 		f := queue.Peek()
 		require.NotNil(t, f)
-		require.Equal(t, &wire.DatagramFrame{Data: []byte("foobar")}, f)
-	})
+		require.Equal(t, []byte{byte(i)}, f.Data)
+		queue.Pop()
+	}
+	require.Equal(t, 0, queue.SendQueueLen())
+	require.Nil(t, queue.Peek())
+
+	// after draining the queue, new datagrams are accepted again
+	require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}))
+	require.Equal(t, &wire.DatagramFrame{Data: []byte("foobar")}, queue.Peek())
 }
 
 func TestDatagramQueueReceive(t *testing.T) {
@@ -202,26 +192,24 @@ func TestDatagramQueueClose(t *testing.T) {
 		for range maxDatagramSendQueueLen {
 			require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte{0}}))
 		}
-		errChan1 := make(chan error, 1)
-		go func() { errChan1 <- queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}) }()
-		errChan2 := make(chan error, 1)
+		errChan := make(chan error, 1)
 		go func() {
 			_, err := queue.Receive(context.Background())
-			errChan2 <- err
+			errChan <- err
 		}()
+
+		synctest.Wait()
 
 		queue.CloseWithError(assert.AnError)
 		synctest.Wait()
 
-		select {
-		case err := <-errChan1:
-			require.ErrorIs(t, err, assert.AnError)
-		default:
-			t.Fatal("should have received an error")
-		}
+		// the send queue is cleared
+		require.Equal(t, 0, queue.SendQueueLen())
+		require.Nil(t, queue.Peek())
 
+		// all waiters are woken up
 		select {
-		case err := <-errChan2:
+		case err := <-errChan:
 			require.ErrorIs(t, err, assert.AnError)
 		default:
 			t.Fatal("should have received an error")
@@ -234,4 +222,44 @@ func TestDatagramQueueAddAfterClose(t *testing.T) {
 	queue.CloseWithError(assert.AnError)
 	require.ErrorIs(t, queue.Add(&wire.DatagramFrame{Data: []byte("foo")}), assert.AnError)
 	require.Nil(t, queue.Peek())
+}
+
+func TestDatagramQueueCloseRace(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger, nil)
+
+	const numAdds = 100
+	errChan := make(chan error, numAdds)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range numAdds {
+			errChan <- queue.Add(&wire.DatagramFrame{Data: []byte("foo")})
+		}
+	}()
+	queue.CloseWithError(assert.AnError)
+	<-done
+
+	// every Add either succeeded, was rejected because the queue was full,
+	// or failed with the close error; it must never block
+	var succeeded, full, closed int
+	for range numAdds {
+		err := <-errChan
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrDatagramQueueFull):
+			full++
+		default:
+			require.ErrorIs(t, err, assert.AnError)
+			closed++
+		}
+	}
+	require.LessOrEqual(t, succeeded, maxDatagramSendQueueLen)
+	require.Positive(t, full+closed)
+
+	// the queue was cleared by the close
+	require.Equal(t, 0, queue.SendQueueLen())
+	require.Nil(t, queue.Peek())
+	// adding after the close returns the close error
+	require.ErrorIs(t, queue.Add(&wire.DatagramFrame{Data: []byte("foo")}), assert.AnError)
 }
