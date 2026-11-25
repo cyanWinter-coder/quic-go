@@ -132,6 +132,115 @@ func TestPacerNoOverflows(t *testing.T) {
 	require.Greater(t, p.Budget(next, rate), initialMaxDatagramSize)
 }
 
+// After an idle period, the budget is rebuilt from the current bandwidth
+// estimate: a single maximum burst is released, without accumulating credit
+// for the idle period or carrying over the leftover budget.
+func TestPacerIdleResume(t *testing.T) {
+	// Use a rate high enough that the max burst is determined by the pacing
+	// delay, not by the packet count: 10,000 packets/s * 2ms = 20 packets.
+	const rate = 10000 * bandwidth(initialMaxDatagramSize) * bytesPerSecond
+	p := newPacer(initialMaxDatagramSize)
+	now := monotime.Now()
+	maxBurst := p.maxBurstSize(rate)
+	require.Equal(t, 20*initialMaxDatagramSize, maxBurst)
+
+	// consume half of the budget
+	p.SentPacket(now, maxBurst/2, rate)
+	require.Equal(t, maxBurst/2, p.Budget(now, rate))
+
+	// idle for a long time
+	now = now.Add(time.Minute)
+	// The budget is rebuilt from the current bandwidth estimate.
+	// It is a single maximum burst: the leftover budget is discarded,
+	// and no credit is accumulated for the idle period.
+	require.Equal(t, maxBurst, p.Budget(now, rate))
+
+	// The rebuilt budget uses the bandwidth estimate at resume time,
+	// not the estimate from before the idle period.
+	const halfRate = rate / 2
+	require.Equal(t, p.maxBurstSize(halfRate), p.Budget(now, halfRate))
+
+	// sending after the idle period consumes from the rebuilt budget
+	p.SentPacket(now, initialMaxDatagramSize, rate)
+	require.Equal(t, maxBurst-initialMaxDatagramSize, p.Budget(now, rate))
+}
+
+// The burst released by a single Budget call never exceeds twice the maximum
+// burst size, no matter how much budget was accumulated.
+func TestPacerBurstCap(t *testing.T) {
+	const rate = 50 * bandwidth(initialMaxDatagramSize) * bytesPerSecond // 50 full-size packets per second
+	p := newPacer(initialMaxDatagramSize)
+	now := monotime.Now()
+	const maxBurst = maxBurstSizePackets * initialMaxDatagramSize
+
+	p.SentPacket(now, initialMaxDatagramSize, rate)
+	// Accumulate budget over pauses that are shorter than the idle threshold
+	// (200ms at this rate): each 150ms pause accumulates 7.5 packets.
+	for i := range 10 {
+		now = now.Add(150 * time.Millisecond)
+		p.SentPacket(now, 1, rate) // send a tiny packet to keep most of the budget
+		if i == 0 {
+			// budget accumulates beyond a single max burst...
+			require.Greater(t, p.Budget(now, rate), maxBurst)
+		}
+	}
+	// ...but a single release never exceeds twice the max burst size.
+	require.Equal(t, 2*maxBurst, p.Budget(now.Add(150*time.Millisecond), rate))
+}
+
+// When the congestion window shrinks, the pacing rate drops and the leftover
+// budget shrinks proportionally: we don't keep sending at the old rate.
+func TestPacerWindowShrink(t *testing.T) {
+	const rate = 100 * bandwidth(initialMaxDatagramSize) * bytesPerSecond // 100 full-size packets per second
+	p := newPacer(initialMaxDatagramSize)
+	now := monotime.Now()
+
+	// consume one packet, leaving 9 packets of budget
+	p.SentPacket(now, initialMaxDatagramSize, rate)
+	require.Equal(t, 9*initialMaxDatagramSize, p.Budget(now, rate))
+
+	// The congestion window is cut in half, halving the pacing rate.
+	// The leftover budget shrinks proportionally, effective immediately.
+	const newRate = rate / 2
+	require.Equal(t, 9*initialMaxDatagramSize/2, p.Budget(now, newRate))
+
+	// sending consumes from the shrunken budget
+	p.SentPacket(now, initialMaxDatagramSize, newRate)
+	require.Equal(t, 9*initialMaxDatagramSize/2-initialMaxDatagramSize, p.Budget(now, newRate))
+
+	// drain the budget
+	for p.Budget(now, newRate) > 0 {
+		p.SentPacket(now, initialMaxDatagramSize, newRate)
+	}
+	// The pacing delay is based on the new (halved) rate of 50 packets/s,
+	// not the old rate of 100 packets/s.
+	require.Equal(t, time.Second/50, p.TimeUntilSend(newRate).Sub(now))
+}
+
+// When the bandwidth estimate increases, the new budget takes effect
+// immediately: the leftover budget is rescaled, and the budget accumulated at
+// the old rate is not consumed as-is.
+func TestPacerBandwidthIncrease(t *testing.T) {
+	const rate = 50 * bandwidth(initialMaxDatagramSize) * bytesPerSecond // 50 full-size packets per second
+	p := newPacer(initialMaxDatagramSize)
+	now := monotime.Now()
+
+	// consume one packet, leaving 9 packets of budget
+	p.SentPacket(now, initialMaxDatagramSize, rate)
+	require.Equal(t, 9*initialMaxDatagramSize, p.Budget(now, rate))
+
+	// The bandwidth estimate doubles. The leftover budget is rescaled to the
+	// new rate, effective immediately.
+	require.Equal(t, 2*9*initialMaxDatagramSize, p.Budget(now, 2*rate))
+
+	// Sending consumes from the rescaled budget, and the new rate is retained:
+	// when the estimate drops back, the leftover is converted from the
+	// budget tracked at the increased rate, not the original one.
+	p.SentPacket(now, initialMaxDatagramSize, 2*rate)
+	require.Equal(t, 2*9*initialMaxDatagramSize-initialMaxDatagramSize, p.Budget(now, 2*rate))
+	require.Equal(t, (2*9*initialMaxDatagramSize-initialMaxDatagramSize)/2, p.Budget(now, rate))
+}
+
 func BenchmarkPacer(b *testing.B) {
 	const rate = 50 * bandwidth(initialMaxDatagramSize) * bytesPerSecond // 50 full-size packets per second
 	p := newPacer(initialMaxDatagramSize)

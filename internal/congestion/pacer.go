@@ -2,6 +2,7 @@ package congestion
 
 import (
 	"math"
+	"math/bits"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -15,11 +16,19 @@ const maxBurstSizePackets = 10
 // Example: For a packet pacing delay of 200μs, we would send 5 packets at once, wait for 1ms, and so forth.
 const minPacingDelay = time.Millisecond
 
+// maxBurstFactor limits the burst released by a single Budget call
+// to twice the maximum burst size.
+const maxBurstFactor = 2
+
 // The pacer implements a token bucket pacing algorithm.
 type pacer struct {
 	budgetAtLastSent protocol.ByteCount
-	maxDatagramSize  protocol.ByteCount
-	lastSentTime     monotime.Time
+	// rateAtLastSent is the pacing rate that budgetAtLastSent was accumulated at.
+	// When the rate changes (e.g. because the congestion window was reduced),
+	// the leftover budget is rescaled instead of being consumed at the stale rate.
+	rateAtLastSent  bandwidth
+	maxDatagramSize protocol.ByteCount
+	lastSentTime    monotime.Time
 }
 
 func newPacer(maxDatagramSize protocol.ByteCount) *pacer {
@@ -36,22 +45,52 @@ func (p *pacer) SentPacket(sendTime monotime.Time, size protocol.ByteCount, rate
 		p.budgetAtLastSent = budget - size
 	}
 	p.lastSentTime = sendTime
+	p.rateAtLastSent = rate
 }
 
 func (p *pacer) Budget(now monotime.Time, rate bandwidth) protocol.ByteCount {
 	if p.lastSentTime.IsZero() {
 		return p.maxBurstSize(rate)
 	}
-	delta := now.Sub(p.lastSentTime)
+	maxBurst := p.maxBurstSize(rate)
 	var added protocol.ByteCount
-	if delta > 0 {
+	if delta := now.Sub(p.lastSentTime); delta > 0 {
 		added = p.timeScaledBandwidth(delta, rate)
+		// The connection was idle for long enough to accumulate a full burst.
+		// Don't accumulate credit for the idle period: rebuild the budget from
+		// the current bandwidth estimate, and release a single maximum burst.
+		if added >= maxBurst {
+			return maxBurst
+		}
 	}
-	budget := p.budgetAtLastSent + added
-	if added > 0 && budget < p.budgetAtLastSent {
+	leftover := p.rescaledBudget(rate)
+	budget := leftover + added
+	if budget < leftover { // overflow
 		budget = protocol.MaxByteCount
 	}
-	return min(p.maxBurstSize(rate), budget)
+	// A single burst is limited to twice the maximum burst size.
+	return min(maxBurstFactor*maxBurst, budget)
+}
+
+// rescaledBudget returns the leftover budget from the last send, converted to
+// the current pacing rate. When the bandwidth estimate changes (e.g. because
+// the congestion window was cut), the new budget takes effect immediately,
+// instead of consuming the budget that was accumulated at the stale rate.
+func (p *pacer) rescaledBudget(rate bandwidth) protocol.ByteCount {
+	if p.budgetAtLastSent <= 0 || p.rateAtLastSent <= 0 || p.rateAtLastSent == rate {
+		return p.budgetAtLastSent
+	}
+	// budget * rate / rateAtLastSent, with saturation on overflow.
+	// The result is capped by the burst limit in Budget, so saturating is fine.
+	hi, lo := bits.Mul64(uint64(p.budgetAtLastSent), uint64(rate))
+	if hi >= uint64(p.rateAtLastSent) {
+		return protocol.MaxByteCount
+	}
+	q, _ := bits.Div64(hi, lo, uint64(p.rateAtLastSent))
+	if q > math.MaxInt64 {
+		return protocol.MaxByteCount
+	}
+	return protocol.ByteCount(q)
 }
 
 func (p *pacer) maxBurstSize(rate bandwidth) protocol.ByteCount {
@@ -81,14 +120,19 @@ func (p *pacer) timeScaledBandwidth(d time.Duration, rate bandwidth) protocol.By
 	return scaled
 }
 
-// TimeUntilSend returns when the next packet should be sent.
-// It returns zero if a packet can be sent immediately.
-func (p *pacer) TimeUntilSend(rate bandwidth) monotime.Time {
-	if p.lastSentTime.IsZero() || p.budgetAtLastSent >= p.maxDatagramSize {
+// pacingDelay returns how long the caller needs to wait before sending the
+// next packet, measured from the time the last packet was sent.
+// It returns 0 if a packet can be sent immediately.
+func (p *pacer) pacingDelay(rate bandwidth) time.Duration {
+	budget := p.Budget(p.lastSentTime, rate)
+	if budget >= p.maxDatagramSize {
 		return 0
 	}
-	diff := 1e9 * uint64(p.maxDatagramSize-p.budgetAtLastSent)
 	bw := uint64(rate / bytesPerSecond)
+	if bw == 0 {
+		return minPacingDelay
+	}
+	diff := 1e9 * uint64(p.maxDatagramSize-budget)
 	// We might need to round up this value.
 	// Otherwise, we might have a budget (slightly) smaller than the datagram size when the timer expires.
 	d := diff / bw
@@ -96,7 +140,19 @@ func (p *pacer) TimeUntilSend(rate bandwidth) monotime.Time {
 	if diff%bw > 0 {
 		d++
 	}
-	return p.lastSentTime.Add(max(minPacingDelay, time.Duration(d)*time.Nanosecond))
+	return max(minPacingDelay, time.Duration(d)*time.Nanosecond)
+}
+
+// TimeUntilSend returns when the next packet should be sent.
+// It returns zero if a packet can be sent immediately.
+func (p *pacer) TimeUntilSend(rate bandwidth) monotime.Time {
+	if p.lastSentTime.IsZero() {
+		return 0
+	}
+	if d := p.pacingDelay(rate); d > 0 {
+		return p.lastSentTime.Add(d)
+	}
+	return 0
 }
 
 func (p *pacer) SetMaxDatagramSize(s protocol.ByteCount) {
