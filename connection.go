@@ -884,6 +884,10 @@ func (c *Conn) maybeResetTimer() {
 			}
 		}
 	}
+	// Retired connection IDs are invalidated as soon as their grace period expires.
+	if t := c.connIDGenerator.NextRetireTime(); !t.IsZero() && t.Before(deadline) {
+		deadline = t
+	}
 	// If the connection is hard-blocked, we can't even send acknowledgments,
 	// nor can we send PTO probe packets.
 	if c.blocked == blockModeHardBlocked {
@@ -1220,6 +1224,9 @@ func (c *Conn) handleShortHeaderPacket(
 		wasQueued, err = c.handleUnpackError(err, p, qlog.PacketType1RTT, datagramPayloadChecksum)
 		return false, err
 	}
+	if err := c.connIDGenerator.CheckReceivedConnectionID(destConnID); err != nil {
+		return false, err
+	}
 	c.largestRcvdAppData = max(c.largestRcvdAppData, pn)
 
 	if c.logger.Debug() {
@@ -1437,6 +1444,9 @@ func (c *Conn) handleLongHeaderPacket(
 	packet, err := c.unpacker.UnpackLongHeader(hdr, p.data)
 	if err != nil {
 		wasQueued, err = c.handleUnpackError(err, p, toQlogPacketType(hdr.Type), datagramPayloadChecksum)
+		return false, err
+	}
+	if err := c.connIDGenerator.CheckReceivedConnectionID(hdr.DestConnectionID); err != nil {
 		return false, err
 	}
 

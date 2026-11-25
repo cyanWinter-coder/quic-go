@@ -130,7 +130,7 @@ func (h *connIDManager) add(f *wire.NewConnectionIDFrame) error {
 	// If this frame's connection ID is in use or was retired, the peer might not have provided a new connection ID yet.
 	// The active connection ID is then retired once it does.
 	if h.activeSequenceNumber < h.highestRetired && len(h.queue) > 0 {
-		h.updateConnectionID()
+		h.updateConnectionIDLocked()
 	}
 	return nil
 }
@@ -184,6 +184,12 @@ func (h *connIDManager) addConnectionID(seq uint64, connID protocol.ConnectionID
 }
 
 func (h *connIDManager) updateConnectionID() {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+	h.updateConnectionIDLocked()
+}
+
+func (h *connIDManager) updateConnectionIDLocked() {
 	h.assertNotClosed()
 	front := h.queue[0]
 	h.queue = h.queue[1:]
@@ -225,6 +231,9 @@ func (h *connIDManager) Close() {
 // is called when the server performs a Retry
 // and when the server changes the connection ID in the first Initial sent
 func (h *connIDManager) ChangeInitialConnID(newConnID protocol.ConnectionID) {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
 	if h.activeSequenceNumber != 0 {
 		panic("expected first connection ID to have sequence number 0")
 	}
@@ -233,6 +242,9 @@ func (h *connIDManager) ChangeInitialConnID(newConnID protocol.ConnectionID) {
 
 // is called when the server provides a stateless reset token in the transport parameters
 func (h *connIDManager) SetStatelessResetToken(token protocol.StatelessResetToken) {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
 	h.assertNotClosed()
 	if h.activeSequenceNumber != 0 {
 		panic("expected first connection ID to have sequence number 0")
@@ -242,6 +254,9 @@ func (h *connIDManager) SetStatelessResetToken(token protocol.StatelessResetToke
 }
 
 func (h *connIDManager) SentPacket() {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
 	h.packetsSinceLastChange++
 }
 
@@ -261,14 +276,20 @@ func (h *connIDManager) shouldUpdateConnID() bool {
 }
 
 func (h *connIDManager) Get() protocol.ConnectionID {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
 	h.assertNotClosed()
 	if h.shouldUpdateConnID() {
-		h.updateConnectionID()
+		h.updateConnectionIDLocked()
 	}
 	return h.activeConnectionID
 }
 
 func (h *connIDManager) SetHandshakeComplete() {
+	h.pathMx.Lock()
+	defer h.pathMx.Unlock()
+
 	h.handshakeComplete = true
 }
 
@@ -333,7 +354,7 @@ func (h *connIDManager) SwitchToPath(id pathID) {
 		// or if the peer retired it (using Retire Prior To).
 		// If there's no unused connection ID, there's no choice but to keep using the active one.
 		if len(h.queue) > 0 {
-			h.updateConnectionID()
+			h.updateConnectionIDLocked()
 		}
 		return
 	}

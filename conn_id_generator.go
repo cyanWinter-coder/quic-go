@@ -3,6 +3,7 @@ package quic
 import (
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -15,10 +16,19 @@ import (
 // The value is the pathReceiver that the connection's connection IDs are registered with on that Transport.
 type connRunners map[connRunner]*pathReceiver
 
-func (cr connRunners) AddConnectionID(id protocol.ConnectionID) {
+func (cr connRunners) AddConnectionID(id protocol.ConnectionID) bool {
+	var added []connRunner
 	for r, h := range cr {
-		r.Add(id, h)
+		if !r.Add(id, h) {
+			// Roll back registrations already made on other Transports.
+			for _, addedRunner := range added {
+				addedRunner.Remove(id)
+			}
+			return false
+		}
+		added = append(added, r)
 	}
+	return true
 }
 
 func (cr connRunners) RemoveConnectionID(id protocol.ConnectionID) {
@@ -39,6 +49,7 @@ type connIDToRetire struct {
 }
 
 type connIDGenerator struct {
+	mx          sync.Mutex
 	generator   ConnectionIDGenerator
 	highestSeq  uint64
 	connRunners connRunners
@@ -74,6 +85,9 @@ func newConnIDGenerator(
 }
 
 func (m *connIDGenerator) SetMaxActiveConnIDs(limit uint64) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	if m.generator.ConnectionIDLen() == 0 {
 		return nil
 	}
@@ -84,7 +98,7 @@ func (m *connIDGenerator) SetMaxActiveConnIDs(limit uint64) error {
 	// We currently don't send the preferred_address transport parameter,
 	// so we can issue (limit - 1) connection IDs.
 	for i := uint64(len(m.activeSrcConnIDs)); i < min(limit, protocol.MaxIssuedConnectionIDs); i++ {
-		if err := m.issueNewConnID(); err != nil {
+		if err := m.issueNewConnIDLocked(); err != nil {
 			return err
 		}
 	}
@@ -92,6 +106,9 @@ func (m *connIDGenerator) SetMaxActiveConnIDs(limit uint64) error {
 }
 
 func (m *connIDGenerator) Retire(seq uint64, sentWithDestConnID protocol.ConnectionID, expiry monotime.Time) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	if seq > m.highestSeq {
 		return &qerr.TransportError{
 			ErrorCode:    qerr.ProtocolViolation,
@@ -109,13 +126,25 @@ func (m *connIDGenerator) Retire(seq uint64, sentWithDestConnID protocol.Connect
 			ErrorMessage: fmt.Sprintf("retired connection ID %d (%s), which was used as the Destination Connection ID on this packet", seq, connID),
 		}
 	}
-	m.queueConnIDForRetiring(connID, expiry)
+	m.queueConnIDForRetiringLocked(connID, expiry)
 
 	delete(m.activeSrcConnIDs, seq)
-	return m.issueNewConnID()
+	return m.issueNewConnIDLocked()
 }
 
 func (m *connIDGenerator) queueConnIDForRetiring(connID protocol.ConnectionID, expiry monotime.Time) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+	m.queueConnIDForRetiringLocked(connID, expiry)
+}
+
+func (m *connIDGenerator) queueConnIDForRetiringLocked(connID protocol.ConnectionID, expiry monotime.Time) {
+	// Retire is idempotent, but defend against duplicate bookkeeping entries.
+	if slices.ContainsFunc(m.connIDsToRetire, func(c connIDToRetire) bool {
+		return c.connID == connID
+	}) {
+		return
+	}
 	idx := slices.IndexFunc(m.connIDsToRetire, func(c connIDToRetire) bool {
 		return c.t.After(expiry)
 	})
@@ -126,24 +155,87 @@ func (m *connIDGenerator) queueConnIDForRetiring(connID protocol.ConnectionID, e
 }
 
 func (m *connIDGenerator) issueNewConnID() error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+	return m.issueNewConnIDLocked()
+}
+
+func (m *connIDGenerator) issueNewConnIDLocked() error {
+	seq := m.highestSeq + 1
+	if _, ok := m.activeSrcConnIDs[seq]; ok {
+		return &qerr.TransportError{
+			ErrorCode:    qerr.InternalError,
+			ErrorMessage: fmt.Sprintf("connection ID sequence number %d has already been issued", seq),
+		}
+	}
 	connID, err := m.generator.GenerateConnectionID()
 	if err != nil {
 		return err
 	}
-	m.activeSrcConnIDs[m.highestSeq+1] = connID
-	m.connRunners.AddConnectionID(connID)
+	// Don't advertise an ID that is already registered, e.g. with a Transport that still keeps a
+	// recently closed connection's ID for delayed packets.
+	if !m.connRunners.AddConnectionID(connID) {
+		return &qerr.TransportError{
+			ErrorCode:    qerr.InternalError,
+			ErrorMessage: fmt.Sprintf("generated duplicate connection ID %s", connID),
+		}
+	}
+	m.activeSrcConnIDs[seq] = connID
 	m.queueControlFrame(&wire.NewConnectionIDFrame{
-		SequenceNumber:      m.highestSeq + 1,
+		SequenceNumber:      seq,
 		ConnectionID:        connID,
 		StatelessResetToken: m.statelessResetter.GetStatelessResetToken(connID),
 	})
-	m.highestSeq++
+	m.highestSeq = seq
 	return nil
 }
 
+// NextRetireTime returns the earliest time at which a retired connection ID can be removed.
+func (m *connIDGenerator) NextRetireTime() monotime.Time {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
+	if len(m.connIDsToRetire) == 0 {
+		return 0
+	}
+	return m.connIDsToRetire[0].t
+}
+
+// CheckReceivedConnectionID validates that id is still allowed to identify this connection.
+// Retired IDs remain valid until their grace period expires and RemoveRetiredConnIDs removes them.
+func (m *connIDGenerator) CheckReceivedConnectionID(id protocol.ConnectionID) error {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
+	// Zero-length connection IDs are shared by all packets and have no retirement state.
+	if m.generator.ConnectionIDLen() == 0 {
+		return nil
+	}
+	if m.initialClientDestConnID.Valid() && m.initialClientDestConnID == id {
+		return nil
+	}
+	for _, connID := range m.activeSrcConnIDs {
+		if connID == id {
+			return nil
+		}
+	}
+	if slices.ContainsFunc(m.connIDsToRetire, func(c connIDToRetire) bool {
+		return c.connID == id
+	}) {
+		return nil
+	}
+	return &qerr.TransportError{
+		ErrorCode:    qerr.ProtocolViolation,
+		ErrorMessage: fmt.Sprintf("received packet for retired or unknown connection ID %s", id),
+	}
+}
+
 func (m *connIDGenerator) SetHandshakeComplete(connIDExpiry monotime.Time) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	if m.initialClientDestConnID.Valid() {
-		m.queueConnIDForRetiring(m.initialClientDestConnID, connIDExpiry)
+		m.queueConnIDForRetiringLocked(m.initialClientDestConnID, connIDExpiry)
 		m.initialClientDestConnID = protocol.ConnectionID{}
 	}
 }
@@ -151,23 +243,32 @@ func (m *connIDGenerator) SetHandshakeComplete(connIDExpiry monotime.Time) {
 // IsInitialClientDestConnID reports whether the connection ID is the one the client used on its Initial packets.
 // It returns false on the client, and once the handshake is complete.
 func (m *connIDGenerator) IsInitialClientDestConnID(id protocol.ConnectionID) bool {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	return m.initialClientDestConnID.Valid() && m.initialClientDestConnID == id
 }
 
 func (m *connIDGenerator) RemoveRetiredConnIDs(now monotime.Time) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	if len(m.connIDsToRetire) == 0 {
 		return
 	}
-	for _, c := range m.connIDsToRetire {
-		if c.t.After(now) {
-			break
-		}
+	remaining := m.connIDsToRetire
+	for len(remaining) > 0 && !remaining[0].t.After(now) {
+		c := remaining[0]
+		remaining = remaining[1:]
 		m.connRunners.RemoveConnectionID(c.connID)
-		m.connIDsToRetire = m.connIDsToRetire[1:]
 	}
+	m.connIDsToRetire = remaining
 }
 
 func (m *connIDGenerator) RemoveAll() {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	if m.initialClientDestConnID.Valid() {
 		m.connRunners.RemoveConnectionID(m.initialClientDestConnID)
 	}
@@ -177,9 +278,15 @@ func (m *connIDGenerator) RemoveAll() {
 	for _, c := range m.connIDsToRetire {
 		m.connRunners.RemoveConnectionID(c.connID)
 	}
+	m.initialClientDestConnID = protocol.ConnectionID{}
+	clear(m.activeSrcConnIDs)
+	m.connIDsToRetire = nil
 }
 
 func (m *connIDGenerator) ReplaceWithClosed(connClose []byte, expiry time.Duration) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	connIDs := make([]protocol.ConnectionID, 0, len(m.activeSrcConnIDs)+len(m.connIDsToRetire)+1)
 	if m.initialClientDestConnID.Valid() {
 		connIDs = append(connIDs, m.initialClientDestConnID)
@@ -195,6 +302,9 @@ func (m *connIDGenerator) ReplaceWithClosed(connClose []byte, expiry time.Durati
 
 // Handler returns the pathReceiver that the connection IDs are registered with on the transport.
 func (m *connIDGenerator) Handler(runner connRunner) (*pathReceiver, bool) {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	h, ok := m.connRunners[runner]
 	return h, ok
 }
@@ -202,6 +312,9 @@ func (m *connIDGenerator) Handler(runner connRunner) (*pathReceiver, bool) {
 // AddConnRunner registers all connection IDs with the pathReceiver on the transport.
 // It returns false if the transport was already added.
 func (m *connIDGenerator) AddConnRunner(runner connRunner, h *pathReceiver) bool {
+	m.mx.Lock()
+	defer m.mx.Unlock()
+
 	// The transport might have already been added earlier.
 	// This happens for every PATH_CHALLENGE sent on the transport after the first one (including retransmissions),
 	// and if the application migrates back to an old path.
