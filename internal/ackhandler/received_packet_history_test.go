@@ -94,6 +94,85 @@ func TestReceivedPacketHistoryRanges(t *testing.T) {
 	}, slices.Collect(hist.Backward()))
 }
 
+func TestReceivedPacketHistoryReorderingAndMerging(t *testing.T) {
+	hist := newReceivedPacketHistory()
+
+	// packets arrive heavily out of order
+	for _, pn := range []protocol.PacketNumber{10, 3, 7, 1, 5} {
+		require.True(t, hist.ReceivedPacket(pn))
+	}
+	require.Equal(t, []interval{
+		{Start: 10, End: 10},
+		{Start: 7, End: 7},
+		{Start: 5, End: 5},
+		{Start: 3, End: 3},
+		{Start: 1, End: 1},
+	}, slices.Collect(hist.Backward()))
+
+	// fill the gap between two ranges, extending the lower one at the end
+	require.True(t, hist.ReceivedPacket(6))
+	require.Equal(t, []interval{
+		{Start: 10, End: 10},
+		{Start: 5, End: 7},
+		{Start: 3, End: 3},
+		{Start: 1, End: 1},
+	}, slices.Collect(hist.Backward()))
+
+	// fill the remaining gap, which merges two adjacent ranges into one
+	require.True(t, hist.ReceivedPacket(4))
+	require.Equal(t, []interval{
+		{Start: 10, End: 10},
+		{Start: 3, End: 7},
+		{Start: 1, End: 1},
+	}, slices.Collect(hist.Backward()))
+
+	// close the last gap at the bottom
+	require.True(t, hist.ReceivedPacket(2))
+	require.Equal(t, []interval{
+		{Start: 10, End: 10},
+		{Start: 1, End: 7},
+	}, slices.Collect(hist.Backward()))
+
+	// close the last gap at the top
+	require.True(t, hist.ReceivedPacket(8))
+	require.True(t, hist.ReceivedPacket(9))
+	require.Equal(t, []interval{{Start: 1, End: 10}}, slices.Collect(hist.Backward()))
+
+	// the ranges always stay ordered and non-overlapping
+	ranges := slices.Collect(hist.Backward())
+	for i := 1; i < len(ranges); i++ {
+		require.Greater(t, ranges[i-1].Start, ranges[i].End)
+	}
+}
+
+func TestReceivedPacketHistoryTruncationKeepsLargestPackets(t *testing.T) {
+	hist := newReceivedPacketHistory()
+
+	// fill the history with MaxNumAckRanges single-packet ranges
+	for i := range protocol.MaxNumAckRanges {
+		require.True(t, hist.ReceivedPacket(protocol.PacketNumber(2*i)))
+	}
+	require.Len(t, hist.ranges, protocol.MaxNumAckRanges)
+	largest := protocol.PacketNumber(2 * (protocol.MaxNumAckRanges - 1))
+	require.Equal(t, interval{Start: largest, End: largest}, hist.ranges[len(hist.ranges)-1])
+
+	// a new range exceeds the limit; the oldest range is pruned, the largest is kept
+	require.True(t, hist.ReceivedPacket(largest+2))
+	require.Len(t, hist.ranges, protocol.MaxNumAckRanges)
+	require.Equal(t, interval{Start: 2, End: 2}, hist.ranges[0])
+	require.Equal(t, interval{Start: largest + 2, End: largest + 2}, hist.ranges[len(hist.ranges)-1])
+
+	// the ranges remain ordered and non-overlapping after truncation
+	for i := 1; i < len(hist.ranges); i++ {
+		require.Less(t, hist.ranges[i-1].End, hist.ranges[i].Start)
+	}
+
+	// filling the gap between the first two ranges merges them instead of growing the slice
+	require.True(t, hist.ReceivedPacket(3))
+	require.Len(t, hist.ranges, protocol.MaxNumAckRanges-1)
+	require.Equal(t, interval{Start: 2, End: 4}, hist.ranges[0])
+}
+
 func TestReceivedPacketHistoryMaxNumAckRanges(t *testing.T) {
 	hist := newReceivedPacketHistory()
 

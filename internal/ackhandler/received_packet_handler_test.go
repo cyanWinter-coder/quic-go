@@ -142,3 +142,45 @@ func TestPacketDuplicateDetection(t *testing.T) {
 	require.NoError(t, handler.ReceivedPacket(4, protocol.ECNNon, protocol.Encryption1RTT, sendTime, true))
 	require.True(t, handler.IsPotentiallyDuplicate(4, protocol.PacketNumberSpaceAppData))
 }
+
+func TestReceivedPacketHandlerClose(t *testing.T) {
+	handler := NewReceivedPacketHandler(utils.DefaultLogger)
+
+	sendTime := monotime.Now()
+	require.NoError(t, handler.ReceivedPacket(1, protocol.ECT0, protocol.Encryption1RTT, sendTime, true))
+	require.NoError(t, handler.ReceivedPacket(2, protocol.ECNNon, protocol.Encryption1RTT, sendTime, true))
+	require.NotNil(t, handler.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), true))
+
+	// after closing, new packets are not accepted...
+	handler.Close()
+	require.NoError(t, handler.ReceivedPacket(5, protocol.ECNCE, protocol.Encryption1RTT, sendTime, true))
+	require.False(t, handler.IsPotentiallyDuplicate(5, protocol.PacketNumberSpaceAppData))
+	// ... and no new ACK information is generated
+	require.Nil(t, handler.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false))
+
+	// closing also applies to the Initial and Handshake packet number spaces
+	require.NoError(t, handler.ReceivedPacket(3, protocol.ECT1, protocol.EncryptionInitial, sendTime, true))
+	require.NoError(t, handler.ReceivedPacket(4, protocol.ECNCE, protocol.EncryptionHandshake, sendTime, true))
+	require.Nil(t, handler.GetAckFrame(protocol.EncryptionInitial, monotime.Now(), false))
+	require.Nil(t, handler.GetAckFrame(protocol.EncryptionHandshake, monotime.Now(), false))
+}
+
+func TestReceivedPacketHandlerDuplicateDoesNotCountECN(t *testing.T) {
+	handler := NewReceivedPacketHandler(utils.DefaultLogger)
+
+	sendTime := monotime.Now()
+	require.NoError(t, handler.ReceivedPacket(1, protocol.ECNCE, protocol.Encryption1RTT, sendTime, true))
+	require.NoError(t, handler.ReceivedPacket(2, protocol.ECT0, protocol.Encryption1RTT, sendTime, true))
+
+	// feed a duplicate through the top-level handler (e.g. a packet the duplicate
+	// detection didn't catch). Its ECN marking must not be counted again.
+	require.NoError(t, handler.ReceivedPacket(1, protocol.ECNCE, protocol.Encryption1RTT, sendTime, true))
+	require.NoError(t, handler.ReceivedPacket(2, protocol.ECT0, protocol.Encryption1RTT, sendTime, true))
+
+	ack := handler.GetAckFrame(protocol.Encryption1RTT, monotime.Now(), false)
+	require.NotNil(t, ack)
+	require.EqualValues(t, 1, ack.ECT0)
+	require.Zero(t, ack.ECT1)
+	require.EqualValues(t, 1, ack.ECNCE)
+	require.Equal(t, []wire.AckRange{{Smallest: 1, Largest: 2}}, ack.AckRanges)
+}

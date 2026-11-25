@@ -15,6 +15,8 @@ type ReceivedPacketHandler struct {
 	appDataPackets   appDataReceivedPacketTracker
 
 	lowest1RTTPacket protocol.PacketNumber
+
+	closed bool
 }
 
 func NewReceivedPacketHandler(logger utils.Logger) *ReceivedPacketHandler {
@@ -26,6 +28,12 @@ func NewReceivedPacketHandler(logger utils.Logger) *ReceivedPacketHandler {
 	}
 }
 
+// Close marks the connection as closed.
+// After closing, no more packets are accepted, and no new ACK information is generated.
+func (h *ReceivedPacketHandler) Close() {
+	h.closed = true
+}
+
 func (h *ReceivedPacketHandler) ReceivedPacket(
 	pn protocol.PacketNumber,
 	ecn protocol.ECN,
@@ -33,16 +41,25 @@ func (h *ReceivedPacketHandler) ReceivedPacket(
 	rcvTime monotime.Time,
 	ackEliciting bool,
 ) error {
+	// Once the connection is closed, no more packets are accepted.
+	if h.closed {
+		return nil
+	}
 	switch encLevel {
 	case protocol.EncryptionInitial:
-		return h.initialPackets.ReceivedPacket(pn, ecn, ackEliciting)
+		if h.initialPackets == nil {
+			return nil
+		}
+		_, err := h.initialPackets.ReceivedPacket(pn, ecn, ackEliciting)
+		return err
 	case protocol.EncryptionHandshake:
 		// The Handshake packet number space might already have been dropped as a result
 		// of processing the CRYPTO frame that was contained in this packet.
 		if h.handshakePackets == nil {
 			return nil
 		}
-		return h.handshakePackets.ReceivedPacket(pn, ecn, ackEliciting)
+		_, err := h.handshakePackets.ReceivedPacket(pn, ecn, ackEliciting)
+		return err
 	case protocol.Encryption0RTT:
 		if h.lowest1RTTPacket != protocol.InvalidPacketNumber && pn > h.lowest1RTTPacket {
 			return fmt.Errorf("received packet number %d on a 0-RTT packet after receiving %d on a 1-RTT packet", pn, h.lowest1RTTPacket)
@@ -82,6 +99,10 @@ func (h *ReceivedPacketHandler) GetAlarmTimeout() monotime.Time {
 }
 
 func (h *ReceivedPacketHandler) GetAckFrame(encLevel protocol.EncryptionLevel, now monotime.Time, onlyIfQueued bool) *wire.AckFrame {
+	// After the connection is closed, no new ACK information is generated.
+	if h.closed {
+		return nil
+	}
 	//nolint:exhaustive // 0-RTT packets can't contain ACK frames.
 	switch encLevel {
 	case protocol.EncryptionInitial:

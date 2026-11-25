@@ -168,6 +168,64 @@ func testSentPacketHandlerSendAndAcknowledge(t *testing.T, encLevel protocol.Enc
 	require.ErrorContains(t, err, "received ACK for an unsent packet")
 }
 
+func TestSentPacketHandlerAckOnlyAcknowledgingAlreadyAckedPackets(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	ecnHandler := NewMockECNHandler(mockCtrl)
+	rttStats := utils.NewRTTStats()
+	rttStats.UpdateRTT(50*time.Millisecond, 0)
+	sph := NewSentPacketHandler(
+		0,
+		1200,
+		rttStats,
+		&utils.ConnectionStats{},
+		true,
+		true,
+		nil,
+		protocol.PerspectiveServer,
+		nil,
+		utils.DefaultLogger,
+	)
+	sph.(*sentPacketHandler).ecnTracker = ecnHandler
+
+	var packets packetTracker
+	now := monotime.Now()
+	pns := make([]protocol.PacketNumber, 5)
+	for i := range pns {
+		pn := sph.PopPacketNumber(protocol.PacketNumberSpaceAppData)
+		ecnHandler.EXPECT().SentPacket(gomock.Any(), pn, protocol.ECT0)
+		sph.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, []Frame{packets.NewPingFrame(pn)}, protocol.Encryption1RTT, protocol.ECT0, 1000, false, false)
+		pns[i] = pn
+	}
+
+	// acknowledge the highest packet, which declares the first two packets lost
+	ecnHandler.EXPECT().HandleNewlyAcked(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(false)
+	ecnHandler.EXPECT().LostPacket(pns[0])
+	ecnHandler.EXPECT().LostPacket(pns[1])
+	_, err := sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[4]), ECT0: 1},
+		protocol.Encryption1RTT,
+		now.Add(100*time.Millisecond),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+	lossTimeoutBefore := sph.GetLossDetectionTimeout()
+	require.False(t, lossTimeoutBefore.IsZero())
+	latestRTTBefore := rttStats.LatestRTT()
+
+	// receive an ACK that only acknowledges packets that were already acknowledged.
+	// It must not change the RTT, must not trigger ECN handling or loss detection,
+	// and must not reset the loss detection timer.
+	_, err = sph.ReceivedAck(
+		&wire.AckFrame{AckRanges: ackRanges(pns[4]), ECT0: 1},
+		protocol.Encryption1RTT,
+		now.Add(time.Second),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+	require.Equal(t, lossTimeoutBefore, sph.GetLossDetectionTimeout())
+	require.Equal(t, latestRTTBefore, rttStats.LatestRTT())
+}
+
 func TestSentPacketHandlerAcknowledgeSkippedPacket(t *testing.T) {
 	sph := NewSentPacketHandler(
 		0,

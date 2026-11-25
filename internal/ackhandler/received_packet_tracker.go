@@ -1,7 +1,6 @@
 package ackhandler
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/monotime"
@@ -27,9 +26,16 @@ func newReceivedPacketTracker() *receivedPacketTracker {
 	return &receivedPacketTracker{packetHistory: *newReceivedPacketHistory()}
 }
 
-func (h *receivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, ackEliciting bool) error {
-	if isNew := h.packetHistory.ReceivedPacket(pn); !isNew {
-		return fmt.Errorf("receivedPacketTracker BUG: ReceivedPacket called for old / duplicate packet %d", pn)
+// ReceivedPacket registers a received packet.
+// It returns true if the packet was newly received, and false if it was a duplicate.
+// Duplicate packets still update the ACK ranges, but their ECN marking is not counted again.
+func (h *receivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, ackEliciting bool) (bool /* is new */, error) {
+	isNew := h.packetHistory.ReceivedPacket(pn)
+	// Duplicate packets only update the ACK ranges. The ECN counters must not be
+	// incremented again, otherwise the reported ECN counts wouldn't match the number
+	// of ECN-marked packets actually received.
+	if !isNew {
+		return false, nil
 	}
 
 	//nolint:exhaustive // Only need to count ECT(0), ECT(1) and ECN-CE.
@@ -42,10 +48,10 @@ func (h *receivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn pro
 		h.ecnce++
 	}
 	if !ackEliciting {
-		return nil
+		return true, nil
 	}
 	h.hasNewAck = true
-	return nil
+	return true, nil
 }
 
 func (h *receivedPacketTracker) GetAckFrame() *wire.AckFrame {
@@ -108,8 +114,14 @@ func newAppDataReceivedPacketTracker(logger utils.Logger) *appDataReceivedPacket
 }
 
 func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, rcvTime monotime.Time, ackEliciting bool) error {
-	if err := h.receivedPacketTracker.ReceivedPacket(pn, ecn, ackEliciting); err != nil {
+	isNew, err := h.receivedPacketTracker.ReceivedPacket(pn, ecn, ackEliciting)
+	if err != nil {
 		return err
+	}
+	// Duplicate packets only update the ACK ranges. They don't change the largest
+	// observed packet, don't reset the ACK timer and must not trigger loss detection.
+	if !isNew {
+		return nil
 	}
 	if pn >= h.largestObserved {
 		h.largestObserved = pn

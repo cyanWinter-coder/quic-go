@@ -36,8 +36,10 @@ func (h *receivedPacketHistory) ReceivedPacket(p protocol.PacketNumber) bool /* 
 	}
 
 	isNew := h.addToRanges(p)
-	// Delete the oldest range, if we're tracking too many of them.
+	// If we're tracking too many ranges, delete the oldest range(s).
 	// This is a DoS defense against a peer that sends us too many gaps.
+	// Ranges are always kept in order, so deleting from the front retains the
+	// ranges containing the largest packet numbers.
 	if len(h.ranges) > protocol.MaxNumAckRanges {
 		h.DeleteBelow(h.ranges[0].End + 1)
 	}
@@ -58,6 +60,8 @@ func (h *receivedPacketHistory) addToRanges(p protocol.PacketNumber) bool /* is 
 
 		if h.ranges[i].End == p-1 { // extend a range at the end
 			h.ranges[i].End = p
+			// If this range is now adjacent to the next one, merge the two ranges.
+			h.mergeWithNext(i)
 			return true
 		}
 		if h.ranges[i].Start == p+1 { // extend a range at the beginning
@@ -73,6 +77,8 @@ func (h *receivedPacketHistory) addToRanges(p protocol.PacketNumber) bool /* is 
 		// create a new range after the current one
 		if p > h.ranges[i].End {
 			h.ranges = slices.Insert(h.ranges, i+1, interval{Start: p, End: p})
+			// the new range might be adjacent to the range following it
+			h.mergeWithNext(i + 1)
 			return true
 		}
 	}
@@ -80,6 +86,16 @@ func (h *receivedPacketHistory) addToRanges(p protocol.PacketNumber) bool /* is 
 	// create a new range at the beginning
 	h.ranges = slices.Insert(h.ranges, 0, interval{Start: p, End: p})
 	return true
+}
+
+// mergeWithNext merges the range at index i with the range at index i+1,
+// if the two ranges are adjacent.
+func (h *receivedPacketHistory) mergeWithNext(i int) {
+	if i+1 >= len(h.ranges) || h.ranges[i].End+1 != h.ranges[i+1].Start {
+		return
+	}
+	h.ranges[i].End = h.ranges[i+1].End
+	h.ranges = slices.Delete(h.ranges, i+1, i+2)
 }
 
 // DeleteBelow deletes all entries below (but not including) p

@@ -743,6 +743,7 @@ runLoop:
 	}
 
 	closeErr := c.closeErr.Load()
+	c.receivedPacketHandler.Close()
 	c.cryptoStreamHandler.Close()
 	c.sendQueue.Close() // close the send queue before sending the CONNECTION_CLOSE
 	c.handleCloseError(closeErr)
